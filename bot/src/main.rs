@@ -8,10 +8,12 @@
 // 255.255.255.0
 // 192.168.88.1
 
+use core::str::FromStr;
 use cyw43_pio::PioSpi;
 use embassy_executor::Spawner;
-use embassy_rp::adc::{Adc, Channel, Config as ConfigAdc, InterruptHandler as InterruptHandlerAdc};
+use embassy_rp::adc::{Adc, Async, Channel, Config as ConfigAdc, InterruptHandler as InterruptHandlerAdc};
 use embassy_net::{Config as ConfigNet, Stack, StackResources, StaticConfigV4};
+use embassy_net::tcp::TcpSocket;
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIN_23, PIN_25, PIO0, USB};
@@ -19,9 +21,10 @@ use embassy_rp::pio::{InterruptHandler as InterruptHandlerPio, Pio};
 use embassy_rp::usb::{Driver, InterruptHandler as InterruptHandlerUsb};
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 use embassy_time::{Duration, Timer};
+use embedded_io_async::{Read, Write};
 use fixed::prelude::ToFixed;
 use rp2040_panic_usb_boot as _;
-use smoltcp::wire::Ipv4Cidr;
+use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 use static_cell::make_static;
 
 bind_interrupts!(struct Irqs {
@@ -29,7 +32,7 @@ bind_interrupts!(struct Irqs {
     ADC_IRQ_FIFO => InterruptHandlerAdc;
     PIO0_IRQ_0 => InterruptHandlerPio<PIO0>;
 });
-
+const SOCKET_BUFFER_SIZE: usize = 128;
 #[embassy_executor::task]
 async fn logger_task(driver: Driver<'static, USB>) {
     embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
@@ -73,6 +76,8 @@ async fn main(spawner: Spawner) {
     // init Analog pin
     let mut adc = Adc::new(p.ADC, Irqs, ConfigAdc::default());
     let mut gp26 = Channel::new_pin(p.PIN_26, Pull::None);
+
+    // spawner.spawn(floor_sensor_task(adc, gp26));
 
     // wheels
     let mut pwm_rhs = Pwm::new_output_ab(p.PWM_CH1, p.PIN_2, p.PIN_3, pwm_config(0, 0));
@@ -138,40 +143,94 @@ async fn main(spawner: Spawner) {
         }
     }
 
-    // Use PWM pins
-    let mut counter = 0;
+    // Connect to TCP server
     loop {
-        log::info!("Link is up: {}", stack.is_link_up());
-        let gp0_level = gp0.get_level();
-        let gp1_level = gp1.get_level();
-        let gp26 = adc.read(&mut gp26).await.unwrap();
-        log::info!(
-            "GP0: {:?}, GP1: {:?}, GP26: {}",
-            gp0_level,
-            gp1_level,
-            gp26,
+        log::info!("connecting...");
+        let mut rx_buffer = [0u8; SOCKET_BUFFER_SIZE];
+        let mut tx_buffer = [0u8; SOCKET_BUFFER_SIZE];
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(Duration::from_secs(300)));
+        let address = Ipv4Address::from_str("192.168.88.250").unwrap();
+        if let Err(err) = socket.connect((address, 9001)).await {
+            log::warn!("connection error: {:?}", err);
+            Timer::after(Duration::from_millis(1000)).await;
+            continue;
+        }
 
-        );
+        // let msg = b"Hello world!\n";
+        // loop {
+        //     log::info!("tx: {}", core::str::from_utf8(msg).unwrap());
+        //     if let Err(err) = socket.write_all(msg).await {
+        //         log::warn!("connection error: {:?}", err);
+        //         break;
+        //     }
+        //     Timer::after(Duration::from_millis(1000)).await;
+        // }
 
-        let (duty_a, duty_b) = match counter % 4 {
-            1 => (MAX_DUTY, 0),
-            2 => (0, MAX_DUTY),
-            // 3 => (MAX_DUTY, MAX_DUTY),
-            _ => (0, 0),
-        };
+        if let Err(err) = socket.write_all(b"NAME:Pierre\n").await {
+            log::warn!("connection error: {:?}", err);
+            break;
+        }
 
-        log::info!("A: {}, B: {}", duty_a, duty_b);
+        loop {
+            let mut buff = [0; 1];
+            if let Err(err) = socket.read_exact(&mut buff).await {
+                log::warn!("connection error: {:?}", err);
+                Timer::after(Duration::from_millis(1000)).await;
+                break;
+            }
 
-        let c1 = pwm_config(duty_a, duty_b);
-        let c2 = pwm_config(duty_a, duty_b);
+            match buff[0] {
+                b'w' => {
+                    pwm_lhs.set_config(&pwm_config(MAX_DUTY, 0));
+                    pwm_rhs.set_config(&pwm_config(MAX_DUTY, 0));
+                },
+                b's' => {
+                    pwm_lhs.set_config(&pwm_config(0, 0));
+                    pwm_rhs.set_config(&pwm_config(0, 0));
+                },
+                x => {
+                    log::info!("unknown command: {x}")
+                }
+            }
+        }
 
-        pwm_rhs.set_config(&c1);
-        pwm_lhs.set_config(&c2);
-
-        counter = (counter + 1) % 4;
-
-        Timer::after(Duration::from_millis(500)).await;
+        // Use PWM pins
+        // let mut counter = 0;
+        // loop {
+        //     log::info!("Link is up: {}", stack.is_link_up());
+        //     let gp0_level = gp0.get_level();
+        //     let gp1_level = gp1.get_level();
+        //     let gp26 = adc.read(&mut gp26).await.unwrap();
+        //     log::info!(
+        //     "GP0: {:?}, GP1: {:?}, GP26: {}",
+        //     gp0_level,
+        //     gp1_level,
+        //     gp26,
+        //
+        // );
+        //
+        //     let (duty_a, duty_b) = match counter % 4 {
+        //         1 => (MAX_DUTY, 0),
+        //         2 => (0, MAX_DUTY),
+        //         // 3 => (MAX_DUTY, MAX_DUTY),
+        //         _ => (0, 0),
+        //     };
+        //
+        //     log::info!("A: {}, B: {}", duty_a, duty_b);
+        //
+        //     let c1 = pwm_config(duty_a, duty_b);
+        //     let c2 = pwm_config(duty_a, duty_b);
+        //
+        //     pwm_rhs.set_config(&c1);
+        //     pwm_lhs.set_config(&c2);
+        //
+        //     counter = (counter + 1) % 4;
+        //
+        //     Timer::after(Duration::from_millis(500)).await;
+        // }
     }
+
 }
 
 
@@ -192,6 +251,15 @@ async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
     stack.run().await
 }
 
+#[embassy_executor::task]
+async fn floor_sensor_task(mut adc: Adc<'static, Async>, mut channel: Channel<'static> ) {
+    loop {
+
+        let gp26 = adc.read(&mut channel).await.unwrap();
+        log::info!("analog: {}", gp26);
+        Timer::after(Duration::from_millis(500)).await;
+    }
+}
 // #[embassy_executor::task]
 // async fn network_task() {
 //
